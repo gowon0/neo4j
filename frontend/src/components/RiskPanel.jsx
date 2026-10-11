@@ -1,6 +1,14 @@
 import { useState } from 'react'
 import { api } from '../api.js'
-import { Card, Chip, ErrorBox, LEVEL_TONE, Spinner, useAsync } from './common.jsx'
+import {
+  Card,
+  Chip,
+  ErrorBox,
+  LEVEL_TONE,
+  Spinner,
+  fmt,
+  useAsync,
+} from './common.jsx'
 
 const KIND_ICON = { material: '▲', external: '◆', disaster: '●' }
 
@@ -51,6 +59,17 @@ function ProjectRisk({ project, defaultOpen }) {
       </button>
       {open && (
         <>
+          {project.link && (
+            <div className="risk-link">
+              <span className="risk-link-label">연결 프로젝트</span>
+              <strong>{project.link.name}</strong>
+              <span>
+                {project.link.region} · {project.link.type} ·{' '}
+                {project.link.start} ~ {project.link.end} ·{' '}
+                {fmt(project.link.scale_m2)}㎡
+              </span>
+            </div>
+          )}
           <ul className="risk-items">
             {shown.map((it) => (
               <RiskItem key={it.id} item={it} />

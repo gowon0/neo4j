@@ -1,126 +1,18 @@
-"""발주/재고 운영 데이터 (로컬 SQLite).
+"""발주/재고 운영 데이터 (Supabase purchase_orders / inventory).
 
-Supabase에는 발주·재고 테이블이 없어, 최초 실행 시 수요이력(평균 수요)을
-기준으로 샘플 데이터를 결정적으로 생성한다. 이후 발주 등록/상태 변경은
-이 DB에 저장된다.
+테이블 생성 SQL은 supabase/schema.sql 참고. 운영 데이터이므로 캐시 없이
+항상 실시간으로 읽고 쓴다.
 """
 
-import os
-import random
-import sqlite3
-import threading
 from datetime import date, timedelta
 
-from server import forecast as fc
+from server import store
 
-
-DB_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data",
-    "erp.db",
-)
 
 ORDER_STATUSES = ["발주대기", "진행중", "발주완료", "지연"]
 
-_lock = threading.Lock()
-
-
-def _connect():
-
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-
-    return conn
-
-
-def _po_number(conn, order_date):
-
-    prefix = f"PO{order_date.strftime('%Y%m%d')}"
-
-    count = conn.execute(
-        "SELECT COUNT(*) FROM orders WHERE po_no LIKE ?",
-        (prefix + "%",),
-    ).fetchone()[0]
-
-    return f"{prefix}{count + 1:03d}"
-
-
-def init_db(forecasts):
-    """테이블 생성 및 최초 1회 샘플 데이터 생성."""
-
-    with _lock, _connect() as conn:
-
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS inventory (
-                material_id   INTEGER PRIMARY KEY,
-                current_stock INTEGER NOT NULL,
-                safety_stock  INTEGER NOT NULL,
-                updated_at    TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                po_no       TEXT PRIMARY KEY,
-                material_id INTEGER NOT NULL,
-                quantity    INTEGER NOT NULL,
-                order_date  TEXT NOT NULL,
-                due_date    TEXT NOT NULL,
-                status      TEXT NOT NULL
-            );
-        """)
-
-        seeded = conn.execute(
-            "SELECT COUNT(*) FROM inventory"
-        ).fetchone()[0]
-
-        if seeded or not forecasts:
-            return
-
-        today = date.today()
-
-        for material_id, data in forecasts.items():
-
-            rng = random.Random(20260000 + material_id)
-
-            last_year = [p["value"] for p in data["history"][-12:]]
-            avg_monthly = sum(last_year) / max(len(last_year), 1)
-
-            safety = max(1, round(avg_monthly * 1.5))
-            current = round(safety * rng.uniform(0.55, 1.35))
-
-            conn.execute(
-                "INSERT INTO inventory VALUES (?, ?, ?, ?)",
-                (material_id, current, safety, today.isoformat()),
-            )
-
-            for _ in range(rng.randint(6, 8)):
-
-                order_date = today - timedelta(days=rng.randint(1, 120))
-                due_date = order_date + timedelta(days=rng.randint(14, 45))
-                quantity = max(
-                    1,
-                    round(avg_monthly * rng.uniform(0.5, 1.5)),
-                )
-
-                if due_date < today:
-                    status = "발주완료" if rng.random() < 0.85 else "지연"
-                elif (today - order_date).days <= 10:
-                    status = rng.choice(["발주대기", "진행중"])
-                else:
-                    status = "진행중"
-
-                conn.execute(
-                    "INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        _po_number(conn, order_date),
-                        material_id,
-                        quantity,
-                        order_date.isoformat(),
-                        due_date.isoformat(),
-                        status,
-                    ),
-                )
+ORDERS = "purchase_orders"
+INVENTORY = "inventory"
 
 
 # ------------------------------------------------------------
@@ -129,56 +21,70 @@ def init_db(forecasts):
 
 def list_orders(material_id=None, status=None):
 
-    query = "SELECT * FROM orders WHERE 1=1"
-    params = []
+    params = {"order": "order_date.desc,po_no.desc"}
 
     if material_id:
-        query += " AND material_id = ?"
-        params.append(material_id)
+        params["material_id"] = f"eq.{material_id}"
 
     if status:
-        query += " AND status = ?"
-        params.append(status)
+        params["status"] = f"eq.{status}"
 
-    query += " ORDER BY order_date DESC, po_no DESC"
+    return store.select(ORDERS, params)
 
-    with _lock, _connect() as conn:
-        return [dict(r) for r in conn.execute(query, params)]
+
+def _next_po_number(order_date):
+
+    prefix = f"PO{order_date.strftime('%Y%m%d')}"
+
+    existing = store.select(
+        ORDERS,
+        {"select": "po_no", "po_no": f"like.{prefix}*"},
+    )
+
+    last = max(
+        (int(r["po_no"][len(prefix):]) for r in existing),
+        default=0,
+    )
+
+    return f"{prefix}{last + 1:03d}"
 
 
 def create_order(material_id, quantity, due_date):
 
     today = date.today()
 
-    with _lock, _connect() as conn:
+    # 동시 등록으로 번호가 겹치면(409) 다음 번호로 재시도
+    for _ in range(3):
 
-        po_no = _po_number(conn, today)
+        po_no = _next_po_number(today)
 
-        conn.execute(
-            "INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                po_no,
-                material_id,
-                quantity,
-                today.isoformat(),
-                due_date,
-                "발주대기",
-            ),
-        )
+        try:
+            store.insert(ORDERS, {
+                "po_no": po_no,
+                "material_id": material_id,
+                "quantity": quantity,
+                "order_date": today.isoformat(),
+                "due_date": due_date,
+                "status": "발주대기",
+                "data_status": "user_input",
+            })
+            return po_no
+        except store.StoreError as error:
+            if getattr(error, "status_code", None) != 409:
+                raise
 
-    return po_no
+    raise store.StoreError("발주번호 생성에 실패했습니다. 다시 시도해 주세요.")
 
 
 def update_order_status(po_no, status):
 
-    with _lock, _connect() as conn:
+    rows = store.update(
+        ORDERS,
+        {"po_no": f"eq.{po_no}"},
+        {"status": status},
+    )
 
-        cursor = conn.execute(
-            "UPDATE orders SET status = ? WHERE po_no = ?",
-            (status, po_no),
-        )
-
-        return cursor.rowcount > 0
+    return len(rows) > 0
 
 
 def fulfillment_rate(days_from, days_to):
@@ -189,39 +95,35 @@ def fulfillment_rate(days_from, days_to):
     start = (today - timedelta(days=days_from)).isoformat()
     end = (today - timedelta(days=days_to)).isoformat()
 
-    with _lock, _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT status, COUNT(*) AS n FROM orders
-            WHERE due_date >= ? AND due_date < ?
-              AND status IN ('발주완료', '지연')
-            GROUP BY status
-            """,
-            (start, end),
-        ).fetchall()
+    rows = store.select(ORDERS, {
+        "select": "status",
+        "and": f"(due_date.gte.{start},due_date.lt.{end})",
+        "status": "in.(발주완료,지연)",
+    })
 
-    counts = {r["status"]: r["n"] for r in rows}
-    done = counts.get("발주완료", 0)
-    total = done + counts.get("지연", 0)
+    done = sum(1 for r in rows if r["status"] == "발주완료")
 
-    if total == 0:
+    if not rows:
         return None
 
-    return round(done / total * 100, 1)
+    return round(done / len(rows) * 100, 1)
 
 
-def pending_quantity(material_id):
+def _pending_by_material():
 
-    with _lock, _connect() as conn:
-        row = conn.execute(
-            """
-            SELECT COALESCE(SUM(quantity), 0) FROM orders
-            WHERE material_id = ? AND status IN ('발주대기', '진행중')
-            """,
-            (material_id,),
-        ).fetchone()
+    rows = store.select(ORDERS, {
+        "select": "material_id,quantity",
+        "status": "in.(발주대기,진행중)",
+    })
 
-    return row[0]
+    pending = {}
+
+    for r in rows:
+        pending[r["material_id"]] = (
+            pending.get(r["material_id"], 0) + r["quantity"]
+        )
+
+    return pending
 
 
 # ------------------------------------------------------------
@@ -261,8 +163,8 @@ def next_month_demand(data, today=None):
 
 def inventory_view(forecasts, material_id=None, status=None):
 
-    with _lock, _connect() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM inventory")]
+    rows = store.select(INVENTORY)
+    pending_map = _pending_by_material()
 
     result = []
 
@@ -280,7 +182,7 @@ def inventory_view(forecasts, material_id=None, status=None):
         safety = row["safety_stock"]
 
         demand_next = next_month_demand(data)
-        pending = pending_quantity(row["material_id"])
+        pending = pending_map.get(row["material_id"], 0)
 
         recommended = max(
             0,

@@ -1,6 +1,7 @@
 """Neo4j 공사프로젝트 노드를 Supabase construction_projects와 연결한다.
 
-매칭 규칙 (프로젝트명 문자열이 서로 달라 속성으로 매칭):
+매칭 규칙 (프로젝트명이 같으면 그대로 연결, 다르면 속성으로 매칭):
+  0. 프로젝트명이 정확히 같은 Supabase 프로젝트가 있으면 그것을 사용
   1. 공사 유형: 노드 이름의 키워드로 유형을 추정해 project_type이 같은 것만 후보
      (예: '변전소 증설공사' -> '변전소 증설', '배전망 확충공사' -> '배전선로 확충')
   2. 미완료: end_date가 오늘 이후인 프로젝트만 후보
@@ -45,6 +46,12 @@ def _first_match(name, table):
 
 
 def find_match(node, projects, today):
+
+    # 0순위: 프로젝트명이 정확히 같으면 그대로 연결
+    exact = [p for p in projects if p["project_name"] == node["name"]]
+
+    if exact:
+        return exact[0], "프로젝트명 일치"
 
     project_type = _first_match(node["name"], TYPE_KEYWORDS)
     region = _first_match(node["name"], REGION_KEYWORDS)

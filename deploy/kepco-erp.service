@@ -1,0 +1,15 @@
+[Unit]
+Description=Material AI demand forecast ERP (FastAPI)
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/kepco-erp
+ExecStart=/opt/kepco-erp/venv/bin/uvicorn server.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

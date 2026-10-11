@@ -17,6 +17,7 @@ from analysis.material import analyze_materials
 from analysis.external_risk import analyze_external_risks
 from analysis.disaster import analyze_disasters
 from llm.chain import generate_short_explanation
+from server import store
 
 
 CACHE_TTL_SECONDS = 1800
@@ -177,6 +178,52 @@ def _summarize(item):
 
 
 # ------------------------------------------------------------
+# 프로젝트 연결 (Neo4j 공사프로젝트 ↔ Supabase construction_projects)
+# 연결 기준은 scripts/link_projects.py 참고
+# ------------------------------------------------------------
+
+def _project_links(db):
+    """{Neo4j 프로젝트명: Supabase 프로젝트 요약}. 연결이 없으면 빈 dict."""
+
+    try:
+        nodes = db.execute_query(
+            "MATCH (p:공사프로젝트) "
+            "RETURN p.name AS name, p.code AS code, "
+            "p.completion AS completion, "
+            "p.supabase_project_id AS linked"
+        )
+        by_id = {
+            p["project_id"]: p
+            for p in store.get_table("construction_projects")
+        }
+    except Exception:
+        return {}
+
+    links = {}
+
+    for node in nodes:
+
+        linked = by_id.get(node["linked"])
+
+        if not linked:
+            continue
+
+        links[node["name"]] = {
+            "code": node["code"],
+            "completion": node["completion"],
+            "project_id": linked["project_id"],
+            "name": linked["project_name"],
+            "region": linked["region"],
+            "type": linked["project_type"],
+            "start": linked["start_date"][:7],
+            "end": linked["end_date"][:7],
+            "scale_m2": linked["project_scale_m2"],
+        }
+
+    return links
+
+
+# ------------------------------------------------------------
 # 집계
 # ------------------------------------------------------------
 
@@ -188,6 +235,7 @@ def _build():
         materials = analyze_materials(db)
         externals = analyze_external_risks(db)
         disasters = analyze_disasters(db)
+        links = _project_links(db)
     finally:
         db.close()
 
@@ -214,6 +262,7 @@ def _build():
         project = projects.setdefault(item["project"], {
             "project": item["project"],
             "status": item["project_status"],
+            "link": links.get(item["project"]),
             "items": [],
         })
 

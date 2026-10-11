@@ -29,9 +29,9 @@ DIST = os.path.join(ROOT, "frontend", "dist")
 def _warm_up():
 
     try:
-        erp.init_db(fc.forecast_all())
+        fc.forecast_all()
     except Exception as error:
-        print(f"[startup] ERP 초기화 실패: {error}")
+        print(f"[startup] 수요예측 사전 계산 실패: {error}")
 
     try:
         risk.get_risks()
@@ -58,10 +58,7 @@ async def store_error_handler(request, error):
 
 def _forecasts():
 
-    forecasts = fc.forecast_all()
-    erp.init_db(forecasts)
-
-    return forecasts
+    return fc.forecast_all()
 
 
 def _month_range(forecasts):

@@ -15,6 +15,8 @@ TABLES = [
     "construction_projects",
     "project_monthly_stats",
     "electricity_usage",
+    "inventory",
+    "purchase_orders",
 ]
 
 CACHE_TTL_SECONDS = 600
@@ -69,6 +71,106 @@ def _fetch_table(name):
         offset += PAGE_SIZE
 
     return rows
+
+
+# ------------------------------------------------------------
+# 실시간 읽기/쓰기 (발주·재고 등 캐시하면 안 되는 운영 데이터)
+# ------------------------------------------------------------
+
+def _headers(prefer=None):
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise StoreError("SUPABASE_URL / SUPABASE_KEY 설정이 없습니다.")
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    if prefer:
+        headers["Prefer"] = prefer
+
+    return headers
+
+
+def _url(table):
+
+    return f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table}"
+
+
+def _check(response, action):
+
+    if response.status_code in (200, 201):
+        return response.json()
+
+    try:
+        detail = response.json().get("message", "")
+    except ValueError:
+        detail = ""
+
+    error = StoreError(
+        f"Supabase {action} 실패 "
+        f"(HTTP {response.status_code}) {detail}".strip()
+    )
+    error.status_code = response.status_code
+
+    raise error
+
+
+def select(table, params=None):
+    """캐시 없이 전체 행 조회. params는 PostgREST 필터(예: {'status': 'eq.진행중'})."""
+
+    rows = []
+    offset = 0
+
+    while True:
+
+        response = requests.get(
+            _url(table),
+            params={
+                "select": "*",
+                "limit": PAGE_SIZE,
+                "offset": offset,
+                **(params or {}),
+            },
+            headers=_headers(),
+            timeout=30,
+        )
+
+        page = _check(response, f"'{table}' 조회")
+        rows.extend(page)
+
+        if len(page) < PAGE_SIZE:
+            return rows
+
+        offset += PAGE_SIZE
+
+
+def insert(table, row):
+
+    response = requests.post(
+        _url(table),
+        json=row,
+        headers=_headers("return=representation"),
+        timeout=30,
+    )
+
+    return _check(response, f"'{table}' 등록")[0]
+
+
+def update(table, match, patch):
+    """match: {'po_no': 'eq.PO...'} 형태. 변경된 행 목록을 반환."""
+
+    response = requests.patch(
+        _url(table),
+        params=match,
+        json=patch,
+        headers=_headers("return=representation"),
+        timeout=30,
+    )
+
+    return _check(response, f"'{table}' 수정")
 
 
 def get_table(name, force=False):

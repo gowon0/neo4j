@@ -16,6 +16,8 @@ const TABLE_LABEL = {
   construction_projects: '공사 프로젝트',
   project_monthly_stats: '프로젝트 월별 통계',
   electricity_usage: '전력 사용량',
+  inventory: '재고 현황',
+  purchase_orders: '발주 내역',
 }
 
 export default function DataManagement() {
@@ -96,7 +98,7 @@ export default function DataManagement() {
         <ul className="plain-list">
           <li>수요·가격·프로젝트 이력: Supabase (읽기 전용, 서버에서만 접근)</li>
           <li>위험 관계 그래프: Neo4j 지식그래프 (원자재 → 기자재 → 수급 → 프로젝트)</li>
-          <li>발주·재고: 서버 로컬 DB(SQLite) — 실제 ERP 연동 전 샘플 데이터</li>
+          <li>발주·재고: Supabase (서버에서 읽기/쓰기, 현재 샘플 데이터)</li>
         </ul>
       </Card>
     </div>

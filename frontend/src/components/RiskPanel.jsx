@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api.js'
+import ExportButtons from './ExportButtons.jsx'
 import {
   Card,
   Chip,
@@ -102,6 +103,11 @@ export default function RiskPanel() {
   }
 
   const extra = (
+    <span className="export-buttons">
+      <ExportButtons
+        label=""
+        build={(format) => ({ path: `/api/export/risks?format=${format}` })}
+      />
     <button
       className="btn btn-ghost"
       onClick={refresh}
@@ -109,6 +115,7 @@ export default function RiskPanel() {
     >
       {refreshing ? '분석 중...' : '새로 분석'}
     </button>
+    </span>
   )
 
   return (

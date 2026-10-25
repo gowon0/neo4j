@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api.js'
+import ExportButtons from '../components/ExportButtons.jsx'
 import {
   Card,
   Chip,
@@ -150,6 +151,11 @@ export default function Orders() {
             조회
           </button>
           <span className="spacer" />
+          <ExportButtons
+            build={(format) => ({
+              path: `/api/export/orders?${new URLSearchParams({ format, ...Object.fromEntries(Object.entries(query).filter(([, v]) => v)) })}`,
+            })}
+          />
           <button className="btn btn-outline" onClick={() => setOpen(true)}>
             + 발주 등록
           </button>

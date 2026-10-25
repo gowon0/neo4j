@@ -10,6 +10,7 @@ import {
   YAxis,
 } from 'recharts'
 import { api } from '../api.js'
+import ExportButtons from '../components/ExportButtons.jsx'
 import {
   Card,
   Chip,
@@ -64,6 +65,12 @@ export default function Inventory() {
           >
             조회
           </button>
+          <span className="spacer" />
+          <ExportButtons
+            build={(format) => ({
+              path: `/api/export/inventory?${new URLSearchParams({ format, ...Object.fromEntries(Object.entries(query).filter(([, v]) => v)) })}`,
+            })}
+          />
         </div>
       </Card>
 

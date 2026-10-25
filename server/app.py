@@ -8,7 +8,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import date
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ from config.settings import (
     DANGER_THRESHOLD,
     VERY_DANGER_THRESHOLD,
 )
-from server import auth, erp, forecast as fc, risk, simulation, store
+from server import auth, erp, export, forecast as fc, risk, simulation, store
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -286,12 +286,50 @@ def forecast(
             "change": (
                 round((demand - prev) / prev * 100, 1) if prev else None
             ),
+            "low": fc.period_sum(data["forecast"], start, end, "low"),
+            "high": fc.period_sum(data["forecast"], start, end, "high"),
             "accuracy": data["accuracy"],
+            "accuracy_2025": data["accuracy_2025"],
+            "model": data["model"]["label"],
+            "model_key": data["model"]["key"],
         })
 
     rows.sort(key=lambda r: r["material_id"])
 
-    return {"start": start, "end": end, "months": months, "rows": rows}
+    return {
+        "start": start,
+        "end": end,
+        "months": months,
+        "rows": rows,
+        "meta": fc.forecast_meta(),
+    }
+
+
+@app.get("/api/forecast/models")
+def forecast_models(
+    material_id: int | None = None,
+    user: str = Depends(auth.current_user),
+):
+    """자재별 후보 모델 백테스트 비교와 선택 결과."""
+
+    forecasts = _forecasts()
+
+    if material_id is not None and material_id not in forecasts:
+        raise HTTPException(404, "자재를 찾을 수 없습니다.")
+
+    items = [
+        {
+            "material_id": d["material_id"],
+            "name": d["name"],
+            "model": d["model"],
+            "accuracy": d["accuracy"],
+            "candidates": d["candidates"],
+        }
+        for d in forecasts.values()
+        if material_id in (None, d["material_id"])
+    ]
+
+    return {"meta": fc.forecast_meta(), "materials": items}
 
 
 @app.get("/api/forecast/series")
@@ -321,8 +359,13 @@ def forecast_series(
             m["actual"] += p["value"]
 
         for p in data["forecast"]:
-            m = monthly.setdefault(p["month"], {"actual": None, "forecast": 0})
+            m = monthly.setdefault(
+                p["month"],
+                {"actual": None, "forecast": 0, "low": 0, "high": 0},
+            )
             m["forecast"] = (m["forecast"] or 0) + p["value"]
+            m["low"] += p["low"]
+            m["high"] += p["high"]
 
     points = [
         {"month": k, **monthly[k]}
@@ -334,11 +377,24 @@ def forecast_series(
     )
 
     if first_forecast:
-        points[first_forecast - 1]["forecast"] = (
-            points[first_forecast - 1]["actual"]
+        last = points[first_forecast - 1]
+        last["forecast"] = last["actual"]
+        last["low"] = last["actual"]
+        last["high"] = last["actual"]
+
+    for p in points:
+        # 예측 구간 밴드용 [하한, 상한] (실적 구간은 없음)
+        p["band"] = (
+            [p["low"], p["high"]] if p.get("low") is not None and p["forecast"] is not None else None
         )
 
-    return {"name": name, "points": points}
+    model = (
+        forecasts[material_id]["model"]["label"]
+        if material_id is not None
+        else "자재별 최적 모델의 합계"
+    )
+
+    return {"name": name, "model": model, "points": points}
 
 
 # ------------------------------------------------------------
@@ -469,6 +525,143 @@ def run_simulation(
         body.demand_change,
         body.delay_days,
     )
+
+
+# ------------------------------------------------------------
+# 내보내기 (CSV / 엑셀)
+# ------------------------------------------------------------
+
+def _material_name(forecasts, material_id):
+
+    if material_id is None:
+        return "전체"
+
+    data = forecasts.get(material_id)
+
+    return data["name"] if data else str(material_id)
+
+
+@app.get("/api/export/orders")
+def export_orders(
+    fmt: str = Query("csv", alias="format"),
+    material_id: int | None = None,
+    status: str | None = None,
+    user: str = Depends(auth.current_user),
+):
+
+    export.check_format(fmt)
+    forecasts = _forecasts()
+    rows = erp.list_orders(material_id, status)
+
+    for row in rows:
+        data = forecasts.get(row["material_id"])
+        row["name"] = data["name"] if data else str(row["material_id"])
+        row["unit"] = data["unit"] if data else ""
+
+    return export.respond("발주목록", fmt, export.orders_sheets(rows))
+
+
+@app.get("/api/export/inventory")
+def export_inventory(
+    fmt: str = Query("csv", alias="format"),
+    material_id: int | None = None,
+    status: str | None = None,
+    user: str = Depends(auth.current_user),
+):
+
+    export.check_format(fmt)
+    rows = erp.inventory_view(_forecasts(), material_id, status)
+
+    return export.respond("재고현황", fmt, export.inventory_sheets(rows))
+
+
+@app.get("/api/export/forecast")
+def export_forecast(
+    fmt: str = Query("csv", alias="format"),
+    material_id: int | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    user: str = Depends(auth.current_user),
+):
+
+    export.check_format(fmt)
+    forecasts = _forecasts()
+    months = _month_range(forecasts)
+
+    start = start or (months[0] if months else "")
+    end = end or (months[-1] if months else "")
+
+    items = sorted(
+        (d for d in forecasts.values() if material_id in (None, d["material_id"])),
+        key=lambda d: d["material_id"],
+    )
+
+    return export.respond(
+        "수요예측",
+        fmt,
+        export.forecast_sheets(items, start, end, fc.period_sum, fc.same_period_last_year),
+    )
+
+
+class SimulationExportBody(SimulationBody):
+    format: str = "csv"
+    compare: bool = False
+
+
+@app.post("/api/export/simulation")
+def export_simulation(
+    body: SimulationExportBody,
+    user: str = Depends(auth.current_user),
+):
+
+    export.check_format(body.format)
+    forecasts = _forecasts()
+    inventory_rows = erp.inventory_view(forecasts)
+    name = _material_name(forecasts, body.material_id)
+
+    if body.compare:
+        rows = []
+
+        for key, scenario in simulation.SCENARIOS.items():
+            result = simulation.simulate(
+                inventory_rows, forecasts, body.material_id, body.start, body.end,
+                scenario["demand_change"], scenario["delay_days"],
+            )
+            rows.append({"key": key, **scenario, **result})
+
+        return export.respond(
+            "시나리오비교", body.format,
+            export.scenarios_sheets(rows, name, body.start, body.end),
+        )
+
+    result = simulation.simulate(
+        inventory_rows, forecasts, body.material_id, body.start, body.end,
+        body.demand_change, body.delay_days,
+    )
+
+    return export.respond(
+        "시뮬레이션", body.format,
+        export.simulation_sheets(result, body.model_dump(), name),
+    )
+
+
+@app.get("/api/export/risks")
+def export_risks(
+    fmt: str = Query("csv", alias="format"),
+    user: str = Depends(auth.current_user),
+):
+
+    export.check_format(fmt)
+
+    try:
+        data = risk.get_risks()
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"지식그래프 위험 분석을 불러오지 못했습니다: {type(error).__name__}",
+        )
+
+    return export.respond("위험알림", fmt, export.risks_sheets(data))
 
 
 # ------------------------------------------------------------

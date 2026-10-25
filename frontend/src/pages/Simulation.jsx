@@ -10,6 +10,7 @@ import {
   YAxis,
 } from 'recharts'
 import { api } from '../api.js'
+import ExportButtons from '../components/ExportButtons.jsx'
 import {
   Card,
   ErrorBox,
@@ -261,6 +262,13 @@ export default function Simulation() {
             <span className="form-error">시작월이 종료월보다 늦습니다.</span>
           )}
           {error && <span className="form-error">{error}</span>}
+          <span className="spacer" />
+          <ExportButtons
+            build={(format) => ({
+              path: '/api/export/simulation',
+              options: { method: 'POST', body: { ...body(), format, compare: tab === 'compare' } },
+            })}
+          />
         </div>
         <p className="hint">
           월별로 (수요 + 목표 안전재고 − 현재고·입고예정)만큼 발주하고, 납기

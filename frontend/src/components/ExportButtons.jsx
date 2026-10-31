@@ -1,13 +1,18 @@
 import { useState } from 'react'
 import { download } from '../api.js'
+import { useAuth } from '../auth.jsx'
 
 /**
  * CSV / 엑셀 내려받기 버튼 한 쌍.
  * build(format) → { path, options? }  (options: { method, body })
+ * perm: 이 권한이 없으면 버튼을 보여주지 않는다 (서버도 같은 권한을 검사한다)
  */
-export default function ExportButtons({ build, label = '내보내기' }) {
+export default function ExportButtons({ build, label = '내보내기', perm }) {
+  const { can } = useAuth()
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+
+  if (perm && !can(perm)) return null
 
   const run = async (format) => {
     setBusy(format)
@@ -23,7 +28,7 @@ export default function ExportButtons({ build, label = '내보내기' }) {
 
   return (
     <span className="export-buttons">
-      <span className="muted">{label}</span>
+      {label && <span className="muted">{label}</span>}
       <button className="btn btn-ghost" onClick={() => run('csv')} disabled={!!busy}>
         {busy === 'csv' ? '받는 중...' : '⬇ CSV'}
       </button>

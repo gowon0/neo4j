@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api.js'
 import ExportButtons from '../components/ExportButtons.jsx'
+import { useAuth } from '../auth.jsx'
 import {
   Card,
   Chip,
@@ -95,6 +96,7 @@ function NewOrderModal({ materials, onClose, onCreated }) {
 }
 
 export default function Orders() {
+  const { can } = useAuth()
   const base = useAsync(() => api.materials(), [])
   const [materialId, setMaterialId] = useState('')
   const [status, setStatus] = useState('')
@@ -152,13 +154,16 @@ export default function Orders() {
           </button>
           <span className="spacer" />
           <ExportButtons
+            perm="orders.export"
             build={(format) => ({
               path: `/api/export/orders?${new URLSearchParams({ format, ...Object.fromEntries(Object.entries(query).filter(([, v]) => v)) })}`,
             })}
           />
-          <button className="btn btn-outline" onClick={() => setOpen(true)}>
-            + 발주 등록
-          </button>
+          {can('orders.create') && (
+            <button className="btn btn-outline" onClick={() => setOpen(true)}>
+              + 발주 등록
+            </button>
+          )}
         </div>
       </Card>
 
@@ -176,13 +181,13 @@ export default function Orders() {
                 <th>발주일</th>
                 <th>납기일</th>
                 <th>상태</th>
-                <th>상태 변경</th>
+                {can('orders.update') && <th>상태 변경</th>}
               </tr>
             </thead>
             <tbody>
               {list.data.rows.length === 0 && (
                 <tr>
-                  <td colSpan="7" className="muted center">
+                  <td colSpan={can('orders.update') ? 7 : 6} className="muted center">
                     조건에 맞는 발주가 없습니다.
                   </td>
                 </tr>
@@ -199,17 +204,19 @@ export default function Orders() {
                   <td>
                     <Chip tone={ORDER_TONE[r.status]}>{r.status}</Chip>
                   </td>
-                  <td>
-                    <select
-                      className="select-sm"
-                      value={r.status}
-                      onChange={(e) => changeStatus(r.po_no, e.target.value)}
-                    >
-                      {list.data.statuses.map((s) => (
-                        <option key={s}>{s}</option>
-                      ))}
-                    </select>
-                  </td>
+                  {can('orders.update') && (
+                    <td>
+                      <select
+                        className="select-sm"
+                        value={r.status}
+                        onChange={(e) => changeStatus(r.po_no, e.target.value)}
+                      >
+                        {list.data.statuses.map((s) => (
+                          <option key={s}>{s}</option>
+                        ))}
+                      </select>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>

@@ -264,6 +264,7 @@ export default function Simulation() {
           {error && <span className="form-error">{error}</span>}
           <span className="spacer" />
           <ExportButtons
+            perm="simulation.export"
             build={(format) => ({
               path: '/api/export/simulation',
               options: { method: 'POST', body: { ...body(), format, compare: tab === 'compare' } },

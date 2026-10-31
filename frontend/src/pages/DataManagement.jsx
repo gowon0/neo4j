@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api.js'
+import { useAuth } from '../auth.jsx'
 import {
   Card,
   Chip,
@@ -21,6 +22,7 @@ const TABLE_LABEL = {
 }
 
 export default function DataManagement() {
+  const { can } = useAuth()
   const { data, error, loading, reload } = useAsync(
     () => api.dataStatus(),
     [],
@@ -46,9 +48,11 @@ export default function DataManagement() {
       <Card
         title="데이터 소스 (Supabase)"
         extra={
-          <button className="btn btn-outline" onClick={refresh} disabled={busy}>
+          can('data.refresh') && (
+            <button className="btn btn-outline" onClick={refresh} disabled={busy}>
             {busy ? '불러오는 중...' : '데이터 새로고침'}
           </button>
+          )
         }
       >
         {message && <p className="hint">{message}</p>}

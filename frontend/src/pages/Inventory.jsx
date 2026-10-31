@@ -67,6 +67,7 @@ export default function Inventory() {
           </button>
           <span className="spacer" />
           <ExportButtons
+            perm="inventory.export"
             build={(format) => ({
               path: `/api/export/inventory?${new URLSearchParams({ format, ...Object.fromEntries(Object.entries(query).filter(([, v]) => v)) })}`,
             })}

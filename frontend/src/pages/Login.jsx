@@ -14,7 +14,7 @@ export default function Login({ onLogin }) {
     try {
       const res = await api.login(id.trim(), password)
       auth.set(res.token)
-      onLogin(res.name)
+      onLogin(res.user)
     } catch (err) {
       setError(err.message)
     } finally {

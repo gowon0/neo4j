@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api.js'
 import ExportButtons from './ExportButtons.jsx'
+import { useAuth } from '../auth.jsx'
 import {
   Card,
   Chip,
@@ -88,6 +89,7 @@ function ProjectRisk({ project, defaultOpen }) {
 }
 
 export default function RiskPanel() {
+  const { can } = useAuth()
   const { data, error, loading, reload } = useAsync(() => api.risks(), [])
   const [refreshing, setRefreshing] = useState(false)
 
@@ -105,16 +107,19 @@ export default function RiskPanel() {
   const extra = (
     <span className="export-buttons">
       <ExportButtons
+        perm="risks.export"
         label=""
         build={(format) => ({ path: `/api/export/risks?format=${format}` })}
       />
-    <button
-      className="btn btn-ghost"
-      onClick={refresh}
-      disabled={refreshing || loading}
-    >
-      {refreshing ? '분석 중...' : '새로 분석'}
-    </button>
+    {can('risks.refresh') && (
+      <button
+        className="btn btn-ghost"
+        onClick={refresh}
+        disabled={refreshing || loading}
+      >
+        {refreshing ? '분석 중...' : '새로 분석'}
+      </button>
+    )}
     </span>
   )
 

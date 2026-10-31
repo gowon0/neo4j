@@ -205,6 +205,7 @@ export default function Forecast() {
           )}
           <span className="spacer" />
           <ExportButtons
+            perm="forecast.export"
             build={(format) => ({
               path: `/api/export/forecast?${new URLSearchParams({
                 format,

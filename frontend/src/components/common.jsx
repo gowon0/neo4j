@@ -86,3 +86,38 @@ export function Card({ title, extra, children, className = '' }) {
     </section>
   )
 }
+
+/** 권한이 없는 화면에 접근했을 때 */
+export function Forbidden() {
+  return (
+    <div className="forbidden">
+      <div className="forbidden-code">403</div>
+      <h2>접근 권한이 없습니다</h2>
+      <p className="muted">
+        이 화면을 볼 수 있는 권한이 없습니다. 필요하면 관리자에게 권한을 요청해 주세요.
+      </p>
+    </div>
+  )
+}
+
+export function Modal({ title, onClose, children, width = 420 }) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" style={{ width }} onClick={(e) => e.stopPropagation()}>
+        <h3>{title}</h3>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+export const fmtDateTime = (iso) =>
+  iso
+    ? new Date(iso).toLocaleString('ko-KR', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    : '-'

@@ -173,6 +173,19 @@ def update(table, match, patch):
     return _check(response, f"'{table}' 수정")
 
 
+def delete(table, match):
+    """match 조건에 맞는 행을 삭제하고 삭제된 행 목록을 반환."""
+
+    response = requests.delete(
+        _url(table),
+        params=match,
+        headers=_headers("return=representation"),
+        timeout=30,
+    )
+
+    return _check(response, f"'{table}' 삭제")
+
+
 def get_table(name, force=False):
 
     now = time.time()

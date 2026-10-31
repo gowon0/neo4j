@@ -8,7 +8,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import date
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ from config.settings import (
     DANGER_THRESHOLD,
     VERY_DANGER_THRESHOLD,
 )
-from server import auth, erp, export, forecast as fc, risk, simulation, store
+from server import accounts, admin, audit, auth, erp, export, forecast as fc, permissions, risk, simulation, store
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +27,11 @@ DIST = os.path.join(ROOT, "frontend", "dist")
 
 
 def _warm_up():
+
+    try:
+        accounts.bootstrap()
+    except Exception as error:
+        print(f"[startup] 계정 초기 설정 실패: {error}")
 
     try:
         fc.forecast_all()
@@ -78,21 +83,40 @@ class LoginBody(BaseModel):
 
 
 @app.post("/api/auth/login")
-def login(body: LoginBody):
+def login(body: LoginBody, request: Request):
 
-    if not auth.verify_credentials(body.id, body.password):
-        raise HTTPException(
-            status_code=401,
-            detail="아이디 또는 비밀번호가 올바르지 않습니다.",
-        )
+    principal, version = auth.authenticate(
+        body.id, body.password, audit.client_ip(request),
+    )
 
-    return {"token": auth.issue_token(body.id), "name": body.id}
+    return {"token": auth.make_token(principal, version), "user": principal.info()}
+
+
+@app.post("/api/auth/logout")
+def logout(
+    request: Request,
+    principal: auth.Principal = Depends(auth.current_principal),
+):
+    """이 사용자의 모든 토큰을 무효화한다."""
+
+    if not principal.emergency:
+        accounts.bump_token_version(principal.id)
+
+    audit.record(principal.username, "logout", ip=audit.client_ip(request))
+
+    return {"ok": True}
 
 
 @app.get("/api/me")
-def me(user: str = Depends(auth.current_user)):
+def me(principal: auth.Principal = Depends(auth.current_principal)):
 
-    return {"id": user, "name": user}
+    return principal.info()
+
+
+@app.get("/api/permissions")
+def permission_catalog(user: auth.Principal = Depends(auth.current_user)):
+
+    return {"permissions": permissions.catalog()}
 
 
 # ------------------------------------------------------------
@@ -116,124 +140,151 @@ def materials(user: str = Depends(auth.current_user)):
 # ------------------------------------------------------------
 
 @app.get("/api/dashboard")
-def dashboard(user: str = Depends(auth.current_user)):
+def dashboard(
+    principal: auth.Principal = Depends(auth.require("dashboard.view")),
+):
+    """권한이 있는 위젯의 데이터만 계산해서 내려준다 (없는 데이터는 응답에 넣지 않음)."""
 
-    forecasts = _forecasts()
-    inventory = erp.inventory_view(forecasts)
+    show_forecast = principal.can("forecast.view")
+    show_orders = principal.can("orders.view")
+    show_inventory = principal.can("inventory.view")
 
+    kpis = []
+    trend = None
+    shortage_items = None
+
+    forecasts = _forecasts() if (show_forecast or show_inventory) else {}
     months = _month_range(forecasts)
-    forecast_year = months[0][:4] if months else str(date.today().year)
-    prev_year = str(int(forecast_year) - 1)
 
-    forecast_total = 0
-    prev_total = 0
-    monthly = {}
+    if show_forecast:
 
-    for data in forecasts.values():
+        forecast_year = months[0][:4] if months else str(date.today().year)
+        prev_year = str(int(forecast_year) - 1)
 
-        for p in data["history"]:
-            if p["month"].startswith(prev_year):
-                prev_total += p["value"]
-            m = monthly.setdefault(p["month"], {"actual": 0, "forecast": None})
-            m["actual"] += p["value"]
+        forecast_total = 0
+        prev_total = 0
+        monthly = {}
 
-        for p in data["forecast"]:
-            if p["month"].startswith(forecast_year):
-                forecast_total += p["value"]
-            m = monthly.setdefault(p["month"], {"actual": None, "forecast": 0})
-            m["forecast"] = (m["forecast"] or 0) + p["value"]
+        for data in forecasts.values():
 
-    demand_delta = (
-        round((forecast_total - prev_total) / prev_total * 100, 1)
-        if prev_total else None
-    )
+            for p in data["history"]:
+                if p["month"].startswith(prev_year):
+                    prev_total += p["value"]
+                m = monthly.setdefault(p["month"], {"actual": 0, "forecast": None})
+                m["actual"] += p["value"]
 
-    ordered_months = sorted(monthly)
-    first_forecast = months[0] if months else None
+            for p in data["forecast"]:
+                if p["month"].startswith(forecast_year):
+                    forecast_total += p["value"]
+                m = monthly.setdefault(p["month"], {"actual": None, "forecast": 0})
+                m["forecast"] = (m["forecast"] or 0) + p["value"]
 
-    trend = []
+        demand_delta = (
+            round((forecast_total - prev_total) / prev_total * 100, 1)
+            if prev_total else None
+        )
 
-    for month in ordered_months[-(24 + len(months)):]:
+        first_forecast = months[0] if months else None
+        trend = [
+            {
+                "month": month,
+                "actual": monthly[month]["actual"],
+                "forecast": monthly[month]["forecast"],
+            }
+            for month in sorted(monthly)[-(24 + len(months)):]
+        ]
 
-        point = {
-            "month": month,
-            "actual": monthly[month]["actual"],
-            "forecast": monthly[month]["forecast"],
-        }
+        # 실측-예측 선이 이어지도록 마지막 실측 지점에 예측 시작값 부여
+        for i, point in enumerate(trend):
+            if point["month"] == first_forecast and i > 0:
+                trend[i - 1]["forecast"] = trend[i - 1]["actual"]
 
-        trend.append(point)
+        kpis.append({
+            "key": "demand",
+            "label": f"{forecast_year}년 예측 수요",
+            "value": forecast_total,
+            "unit": "건",
+            "delta": demand_delta,
+            "note": f"{prev_year}년 실적 대비",
+        })
 
-    # 실측-예측 선이 이어지도록 마지막 실측 지점에 예측 시작값 부여
-    for i, point in enumerate(trend):
-        if point["month"] == first_forecast and i > 0:
-            trend[i - 1]["forecast"] = trend[i - 1]["actual"]
+    if show_orders:
 
-    recent = erp.fulfillment_rate(60, 0)
-    before = erp.fulfillment_rate(120, 60)
-    overall = erp.fulfillment_rate(3650, 0)
+        recent = erp.fulfillment_rate(60, 0)
+        before = erp.fulfillment_rate(120, 60)
+        overall = erp.fulfillment_rate(3650, 0)
 
-    fulfill_value = recent if recent is not None else overall
-    fulfill_delta = (
-        round(recent - before, 1)
-        if recent is not None and before is not None else None
-    )
+        kpis.append({
+            "key": "fulfillment",
+            "label": "발주 이행률",
+            "value": recent if recent is not None else overall,
+            "unit": "%",
+            "delta": (
+                round(recent - before, 1)
+                if recent is not None and before is not None else None
+            ),
+            "note": "최근 60일 납기 기준",
+        })
 
-    stock_total = sum(i["current_stock"] for i in inventory)
-    safety_total = sum(i["safety_stock"] for i in inventory)
-    stock_delta = (
-        round((stock_total - safety_total) / safety_total * 100, 1)
-        if safety_total else None
-    )
+    if show_inventory:
 
-    critical = [i for i in inventory if i["days_left"] is not None]
-    critical.sort(key=lambda i: i["days_left"])
+        inventory = erp.inventory_view(forecasts)
+
+        stock_total = sum(i["current_stock"] for i in inventory)
+        safety_total = sum(i["safety_stock"] for i in inventory)
+        critical = sorted(
+            (i for i in inventory if i["days_left"] is not None),
+            key=lambda i: i["days_left"],
+        )
+
+        kpis.append({
+            "key": "stock",
+            "label": "재고 현황",
+            "value": stock_total,
+            "unit": "건",
+            "delta": (
+                round((stock_total - safety_total) / safety_total * 100, 1)
+                if safety_total else None
+            ),
+            "note": "적정 재고 대비",
+        })
+        kpis.append({
+            "key": "days",
+            "label": "예상 재고 소진일",
+            "value": critical[0]["days_left"] if critical else None,
+            "unit": "일",
+            "delta": None,
+            "note": f"{critical[0]['name']} 기준" if critical else "",
+        })
+        shortage_items = [i for i in inventory if i["status"] != "여유"]
 
     return {
-        "kpis": [
-            {
-                "key": "demand",
-                "label": f"{forecast_year}년 예측 수요",
-                "value": forecast_total,
-                "unit": "건",
-                "delta": demand_delta,
-                "note": f"{prev_year}년 실적 대비",
-            },
-            {
-                "key": "fulfillment",
-                "label": "발주 이행률",
-                "value": fulfill_value,
-                "unit": "%",
-                "delta": fulfill_delta,
-                "note": "최근 60일 납기 기준",
-            },
-            {
-                "key": "stock",
-                "label": "재고 현황",
-                "value": stock_total,
-                "unit": "건",
-                "delta": stock_delta,
-                "note": "적정 재고 대비",
-            },
-            {
-                "key": "days",
-                "label": "예상 재고 소진일",
-                "value": critical[0]["days_left"] if critical else None,
-                "unit": "일",
-                "delta": None,
-                "note": (
-                    f"{critical[0]['name']} 기준" if critical else ""
-                ),
-            },
-        ],
+        "kpis": kpis,
         "trend": trend,
-        "shortage_items": [
-            i for i in inventory if i["status"] != "여유"
-        ],
+        "shortage_items": shortage_items,
+        "widgets": {
+            "forecast": show_forecast,
+            "orders": show_orders,
+            "inventory": show_inventory,
+            "risks": principal.can("risks.view"),
+        },
     }
 
 
 @app.get("/api/risks")
-def risks(refresh: bool = False, user: str = Depends(auth.current_user)):
+def risks(
+    request: Request,
+    refresh: bool = False,
+    principal: auth.Principal = Depends(auth.require("risks.view")),
+):
+
+    if refresh:
+        if not principal.can("risks.refresh"):
+            raise HTTPException(403, auth.FORBIDDEN)
+
+        audit.record(
+            principal.username, "risks_refresh", ip=audit.client_ip(request),
+        )
 
     try:
         return risk.get_risks(force=refresh)
@@ -256,7 +307,7 @@ def forecast(
     material_id: int | None = None,
     start: str | None = None,
     end: str | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("forecast.view")),
 ):
 
     forecasts = _forecasts()
@@ -308,7 +359,7 @@ def forecast(
 @app.get("/api/forecast/models")
 def forecast_models(
     material_id: int | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("forecast.view")),
 ):
     """자재별 후보 모델 백테스트 비교와 선택 결과."""
 
@@ -335,7 +386,7 @@ def forecast_models(
 @app.get("/api/forecast/series")
 def forecast_series(
     material_id: int | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("forecast.view")),
 ):
 
     forecasts = _forecasts()
@@ -405,7 +456,7 @@ def forecast_series(
 def orders(
     material_id: int | None = None,
     status: str | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("orders.view")),
 ):
 
     forecasts = _forecasts()
@@ -427,7 +478,7 @@ class OrderBody(BaseModel):
 
 
 @app.post("/api/orders")
-def create_order(body: OrderBody, user: str = Depends(auth.current_user)):
+def create_order(request: Request, body: OrderBody, user: auth.Principal = Depends(auth.require("orders.create"))):
 
     forecasts = _forecasts()
 
@@ -443,6 +494,10 @@ def create_order(body: OrderBody, user: str = Depends(auth.current_user)):
         raise HTTPException(422, "납기일은 오늘 이후여야 합니다.")
 
     po_no = erp.create_order(body.material_id, body.quantity, due.isoformat())
+    audit.record(
+        user.username, "order_create", target=po_no, ip=audit.client_ip(request),
+        detail={"material_id": body.material_id, "quantity": body.quantity, "due_date": due.isoformat()},
+    )
 
     return {"po_no": po_no}
 
@@ -453,9 +508,10 @@ class StatusBody(BaseModel):
 
 @app.patch("/api/orders/{po_no}")
 def update_order(
+    request: Request,
     po_no: str,
     body: StatusBody,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("orders.update")),
 ):
 
     if body.status not in erp.ORDER_STATUSES:
@@ -463,6 +519,11 @@ def update_order(
 
     if not erp.update_order_status(po_no, body.status):
         raise HTTPException(404, "발주번호를 찾을 수 없습니다.")
+
+    audit.record(
+        user.username, "order_update", target=po_no, ip=audit.client_ip(request),
+        detail={"status": body.status},
+    )
 
     return {"po_no": po_no, "status": body.status}
 
@@ -475,7 +536,7 @@ def update_order(
 def inventory(
     material_id: int | None = None,
     status: str | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("inventory.view")),
 ):
 
     forecasts = _forecasts()
@@ -498,7 +559,7 @@ class SimulationBody(BaseModel):
 
 
 @app.get("/api/simulation/scenarios")
-def scenarios(user: str = Depends(auth.current_user)):
+def scenarios(user: auth.Principal = Depends(auth.require("simulation.run"))):
 
     return {
         "scenarios": [
@@ -510,7 +571,7 @@ def scenarios(user: str = Depends(auth.current_user)):
 @app.post("/api/simulation")
 def run_simulation(
     body: SimulationBody,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("simulation.run")),
 ):
 
     forecasts = _forecasts()
@@ -543,13 +604,18 @@ def _material_name(forecasts, material_id):
 
 @app.get("/api/export/orders")
 def export_orders(
+    request: Request,
     fmt: str = Query("csv", alias="format"),
     material_id: int | None = None,
     status: str | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("orders.view", "orders.export")),
 ):
 
     export.check_format(fmt)
+    audit.record(
+        user.username, "export", target="발주목록", ip=audit.client_ip(request),
+        detail={"format": fmt, "material_id": material_id, "status": status},
+    )
     forecasts = _forecasts()
     rows = erp.list_orders(material_id, status)
 
@@ -563,13 +629,18 @@ def export_orders(
 
 @app.get("/api/export/inventory")
 def export_inventory(
+    request: Request,
     fmt: str = Query("csv", alias="format"),
     material_id: int | None = None,
     status: str | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("inventory.view", "inventory.export")),
 ):
 
     export.check_format(fmt)
+    audit.record(
+        user.username, "export", target="재고현황", ip=audit.client_ip(request),
+        detail={"format": fmt, "material_id": material_id, "status": status},
+    )
     rows = erp.inventory_view(_forecasts(), material_id, status)
 
     return export.respond("재고현황", fmt, export.inventory_sheets(rows))
@@ -577,14 +648,19 @@ def export_inventory(
 
 @app.get("/api/export/forecast")
 def export_forecast(
+    request: Request,
     fmt: str = Query("csv", alias="format"),
     material_id: int | None = None,
     start: str | None = None,
     end: str | None = None,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("forecast.view", "forecast.export")),
 ):
 
     export.check_format(fmt)
+    audit.record(
+        user.username, "export", target="수요예측", ip=audit.client_ip(request),
+        detail={"format": fmt, "material_id": material_id, "start": start, "end": end},
+    )
     forecasts = _forecasts()
     months = _month_range(forecasts)
 
@@ -610,11 +686,16 @@ class SimulationExportBody(SimulationBody):
 
 @app.post("/api/export/simulation")
 def export_simulation(
+    request: Request,
     body: SimulationExportBody,
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("simulation.run", "simulation.export")),
 ):
 
     export.check_format(body.format)
+    audit.record(
+        user.username, "export", target="시뮬레이션", ip=audit.client_ip(request),
+        detail={"format": body.format, "compare": body.compare},
+    )
     forecasts = _forecasts()
     inventory_rows = erp.inventory_view(forecasts)
     name = _material_name(forecasts, body.material_id)
@@ -647,11 +728,16 @@ def export_simulation(
 
 @app.get("/api/export/risks")
 def export_risks(
+    request: Request,
     fmt: str = Query("csv", alias="format"),
-    user: str = Depends(auth.current_user),
+    user: auth.Principal = Depends(auth.require("risks.view", "risks.export")),
 ):
 
     export.check_format(fmt)
+    audit.record(
+        user.username, "export", target="위험알림", ip=audit.client_ip(request),
+        detail={"format": fmt},
+    )
 
     try:
         data = risk.get_risks()
@@ -669,25 +755,26 @@ def export_risks(
 # ------------------------------------------------------------
 
 @app.get("/api/data/status")
-def data_status(user: str = Depends(auth.current_user)):
+def data_status(user: auth.Principal = Depends(auth.require("data.view"))):
 
     return {"tables": store.table_status()}
 
 
 @app.post("/api/data/refresh")
-def data_refresh(user: str = Depends(auth.current_user)):
+def data_refresh(request: Request, user: auth.Principal = Depends(auth.require("data.refresh"))):
 
     store.refresh_all()
     risk.get_risks(force=False)
+    audit.record(user.username, "data_refresh", ip=audit.client_ip(request))
 
     return {"tables": store.table_status()}
 
 
 @app.get("/api/settings")
-def settings(user: str = Depends(auth.current_user)):
+def settings(user: auth.Principal = Depends(auth.require("settings.view"))):
 
     return {
-        "user": user,
+        "user": user.username,
         "admin_id": APP_ADMIN_ID,
         "thresholds": {
             "warning": WARNING_THRESHOLD,
@@ -697,6 +784,9 @@ def settings(user: str = Depends(auth.current_user)):
         "risk_cache_minutes": risk.CACHE_TTL_SECONDS // 60,
         "data_cache_minutes": store.CACHE_TTL_SECONDS // 60,
     }
+
+
+app.include_router(admin.router)
 
 
 # ------------------------------------------------------------
@@ -723,4 +813,9 @@ if os.path.isdir(DIST):
         if path and inside and os.path.isfile(candidate):
             return FileResponse(candidate)
 
-        return FileResponse(os.path.join(DIST, "index.html"))
+        # index.html은 항상 최신본을 받게 하고(재배포 후 옛 화면이 남지 않도록),
+        # 해시가 붙은 /assets 파일만 오래 캐시한다.
+        return FileResponse(
+            os.path.join(DIST, "index.html"),
+            headers={"Cache-Control": "no-cache"},
+        )

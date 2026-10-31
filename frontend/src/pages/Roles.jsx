@@ -63,7 +63,6 @@ export default function Roles() {
   // 선택한 역할이 바뀌거나 서버에서 다시 불러오면 편집 상태를 맞춘다
   useEffect(() => {
     if (!role) return
-    setSelectedId(role.id)
     setPerms(new Set(role.permissions))
     setName(role.name)
     setDescription(role.description)
